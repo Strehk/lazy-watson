@@ -1,8 +1,7 @@
--- Lazy Watson - Inlang i18n Preview for Neovim
--- Displays translation values as virtual text for Paraglide m.keyName() calls
+-- Lazy Watson - i18n preview for Neovim
+-- Supports Paraglide (inlang) and typesafe-i18n via pluggable backends.
 
-local parser = require("lazy-watson.parser")
-local loader = require("lazy-watson.loader")
+local backends = require("lazy-watson.backends")
 local display = require("lazy-watson.display")
 
 local M = {}
@@ -25,7 +24,7 @@ M.config = {
     enabled = true,
     delay = 300,
   },
-  project_pattern = "project.inlang/settings.json",
+  project_pattern = "project.inlang/settings.json", -- kept for back-compat (unused)
 }
 
 -- State
@@ -33,15 +32,15 @@ local state = {
   enabled = true,
   current_locale = nil,
   project_root = nil,
-  messages = {}, -- { [locale] = { [key] = "translation" } }
+  backend = nil,
+  project = nil, -- { base_locale, locales, messages, watch_paths, _data }
+  messages = {}, -- mirror of project.messages for quick access
   attached_buffers = {},
   namespace = nil,
   file_watchers = {},
   debounce_timers = {},
-  settings = nil, -- { baseLocale, locales, pathPattern }
 }
 
--- Supported filetypes
 local supported_filetypes = {
   javascript = true,
   typescript = true,
@@ -50,17 +49,13 @@ local supported_filetypes = {
   typescriptreact = true,
 }
 
---- Initialize the plugin
----@param opts table|nil Configuration options
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
   state.enabled = M.config.enabled
   state.namespace = vim.api.nvim_create_namespace("lazy_watson")
 
-  -- Set up autocommands
   local augroup = vim.api.nvim_create_augroup("LazyWatson", { clear = true })
 
-  -- Attach to supported filetypes
   vim.api.nvim_create_autocmd("FileType", {
     group = augroup,
     pattern = { "javascript", "typescript", "svelte", "javascriptreact", "typescriptreact" },
@@ -69,7 +64,6 @@ function M.setup(opts)
     end,
   })
 
-  -- Update on text changes (debounced)
   vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
     group = augroup,
     callback = function(args)
@@ -79,7 +73,6 @@ function M.setup(opts)
     end,
   })
 
-  -- Cleanup on buffer delete
   vim.api.nvim_create_autocmd("BufDelete", {
     group = augroup,
     callback = function(args)
@@ -87,9 +80,7 @@ function M.setup(opts)
     end,
   })
 
-  -- CursorHold for hover preview
   if M.config.hover.enabled then
-    -- Set updatetime for responsive hover (only if lower than current)
     local hover_delay = M.config.hover.delay or 300
     if hover_delay < vim.o.updatetime then
       vim.o.updatetime = hover_delay
@@ -105,7 +96,6 @@ function M.setup(opts)
     })
   end
 
-  -- Attach to current buffer if it's a supported filetype
   local bufnr = vim.api.nvim_get_current_buf()
   local ft = vim.bo[bufnr].filetype
   if supported_filetypes[ft] then
@@ -113,12 +103,10 @@ function M.setup(opts)
   end
 end
 
---- Toggle preview on/off
 function M.toggle()
   state.enabled = not state.enabled
   if state.enabled then
     vim.notify("Lazy Watson enabled", vim.log.levels.INFO)
-    -- Re-render all attached buffers
     for bufnr, _ in pairs(state.attached_buffers) do
       if vim.api.nvim_buf_is_valid(bufnr) then
         M._update_buffer(bufnr)
@@ -126,7 +114,6 @@ function M.toggle()
     end
   else
     vim.notify("Lazy Watson disabled", vim.log.levels.INFO)
-    -- Clear all virtual text
     for bufnr, _ in pairs(state.attached_buffers) do
       if vim.api.nvim_buf_is_valid(bufnr) then
         display.clear(bufnr, state.namespace)
@@ -135,59 +122,43 @@ function M.toggle()
   end
 end
 
---- Load messages for all locales
-function M._load_all_locales()
-  if not state.project_root or not state.settings then
+function M.refresh()
+  if not state.backend or not state.project_root then
+    vim.notify("Lazy Watson: no active i18n project", vim.log.levels.WARN)
     return
   end
 
-  for _, locale in ipairs(state.settings.locales) do
-    state.messages[locale] = loader.load_messages(
-      state.project_root,
-      state.settings.pathPattern,
-      locale
-    )
+  local project = state.backend.load_project(state.project_root)
+  if not project then
+    vim.notify("Lazy Watson: failed to reload project", vim.log.levels.ERROR)
+    return
   end
-end
 
---- Force reload and re-render
-function M.refresh()
-  -- Clear message cache
-  state.messages = {}
+  state.project = project
+  state.messages = project.messages
+  if not state.current_locale or not project.messages[state.current_locale] then
+    state.current_locale = project.base_locale
+  end
 
-  -- Reload messages for all locales
-  M._load_all_locales()
-
-  -- Re-render all attached buffers
   for bufnr, _ in pairs(state.attached_buffers) do
     if vim.api.nvim_buf_is_valid(bufnr) then
       M._update_buffer(bufnr)
     end
   end
 
-  vim.notify("Lazy Watson translations refreshed", vim.log.levels.INFO)
+  vim.notify(
+    "Lazy Watson translations refreshed (" .. state.backend.name .. ")",
+    vim.log.levels.INFO
+  )
 end
 
---- Open locale picker
 function M.select_locale()
-  -- Very defensive nil checks
-  if state == nil then
-    vim.notify("Watson not initialized", vim.log.levels.WARN)
+  if not state.project or not state.project.locales then
+    vim.notify("No i18n project loaded", vim.log.levels.WARN)
     return
   end
 
-  if state.settings == nil then
-    vim.notify("No inlang project found", vim.log.levels.WARN)
-    return
-  end
-
-  if state.settings.locales == nil then
-    vim.notify("No locales configured", vim.log.levels.WARN)
-    return
-  end
-
-  local locales = state.settings.locales
-
+  local locales = state.project.locales
   if type(locales) ~= "table" or #locales == 0 then
     vim.notify("No locales available", vim.log.levels.WARN)
     return
@@ -202,7 +173,7 @@ function M.select_locale()
       local marker = ""
       if locale == state.current_locale then
         marker = " (current)"
-      elseif locale == state.settings.baseLocale then
+      elseif locale == state.project.base_locale then
         marker = " (base)"
       end
       return locale .. marker
@@ -212,20 +183,14 @@ function M.select_locale()
       return
     end
 
-    -- Wrap in pcall to catch any errors
     local ok, err = pcall(function()
       state.current_locale = choice
 
-      -- Load messages for new locale if not cached
-      if not state.messages[choice] and state.project_root and state.settings then
-        state.messages[choice] = loader.load_messages(
-          state.project_root,
-          state.settings.pathPattern,
-          choice
-        )
+      if not state.messages[choice] and state.backend and state.project_root then
+        state.messages[choice] = state.backend.reload_locale(state.project_root, state.project, choice)
+        state.project.messages[choice] = state.messages[choice]
       end
 
-      -- Defer buffer updates to avoid UI conflicts
       vim.schedule(function()
         for bufnr, _ in pairs(state.attached_buffers) do
           if vim.api.nvim_buf_is_valid(bufnr) then
@@ -244,78 +209,64 @@ function M.select_locale()
   end)
 end
 
---- Get translation key at cursor position
----@return string|nil The translation key or nil if not found
 function M.get_key_at_cursor()
-  local bufnr = vim.api.nvim_get_current_buf()
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  local line_num = cursor[1] - 1 -- 0-indexed
-  local col = cursor[2]
-
-  local matches = parser.find_message_calls(bufnr)
-
-  for _, match in ipairs(matches) do
-    if match.line == line_num then
-      -- Check if cursor is within the match range
-      if col >= match.col_start and col <= match.col_end then
-        return match.key
-      end
-    end
+  if not state.backend then
+    return nil
   end
 
+  local bufnr = vim.api.nvim_get_current_buf()
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local line_num = cursor[1] - 1
+  local col = cursor[2]
+
+  local matches = state.backend.find_message_calls(bufnr)
+  for _, match in ipairs(matches) do
+    if match.line == line_num and col >= match.col_start and col <= match.col_end then
+      return match.key
+    end
+  end
   return nil
 end
 
---- Show hover preview for key at cursor
---- Can be called manually via keybinding or triggered by CursorHold
 function M.show_hover()
   local key = M.get_key_at_cursor()
   if not key then
     return false
   end
-
-  if not state.settings or not state.settings.locales then
+  if not state.project or not state.project.locales then
     return false
   end
 
-  display.show_hover(key, state.messages, state.settings.locales, {
+  display.show_hover(key, state.messages, state.project.locales, {
     max_length = M.config.virtual_text.max_length,
   })
-
   return true
 end
 
---- Internal: Trigger hover preview on CursorHold
 function M._trigger_hover()
   M.show_hover()
 end
 
---- Attach to a buffer
----@param bufnr number Buffer number
 function M._attach_buffer(bufnr)
   if state.attached_buffers[bufnr] then
     return
   end
 
-  -- Get the file path
   local filepath = vim.api.nvim_buf_get_name(bufnr)
   if filepath == "" then
     return
   end
 
-  -- Find project root if not already found
-  if not state.project_root then
-    state.project_root = loader.find_project_root(filepath, M.config.project_pattern)
-    if state.project_root then
-      -- Load settings
-      state.settings = loader.load_settings(state.project_root, M.config.project_pattern)
-      if state.settings then
-        state.current_locale = state.settings.baseLocale
-
-        -- Load messages for ALL locales (needed for hover and missing indicator)
-        M._load_all_locales()
-
-        -- Set up file watchers
+  if not state.backend then
+    local backend, root = backends.detect(filepath)
+    if backend and root then
+      local project = backend.load_project(root)
+      if project then
+        state.backend = backend
+        state.project_root = root
+        state.project = project
+        state.messages = project.messages
+        state.current_locale = project.base_locale
         M._setup_file_watchers()
       end
     end
@@ -323,18 +274,13 @@ function M._attach_buffer(bufnr)
 
   state.attached_buffers[bufnr] = true
 
-  -- Initial render
   if state.enabled then
     M._update_buffer(bufnr)
   end
 end
 
---- Detach from a buffer
----@param bufnr number Buffer number
 function M._detach_buffer(bufnr)
   state.attached_buffers[bufnr] = nil
-
-  -- Cancel any pending debounce timer
   if state.debounce_timers[bufnr] then
     state.debounce_timers[bufnr]:stop()
     state.debounce_timers[bufnr]:close()
@@ -342,82 +288,79 @@ function M._detach_buffer(bufnr)
   end
 end
 
---- Debounced update for a buffer
----@param bufnr number Buffer number
 function M._debounced_update(bufnr)
-  -- Cancel existing timer
   if state.debounce_timers[bufnr] then
     state.debounce_timers[bufnr]:stop()
   else
     state.debounce_timers[bufnr] = vim.uv.new_timer()
   end
 
-  state.debounce_timers[bufnr]:start(M.config.debounce_ms, 0, vim.schedule_wrap(function()
-    if vim.api.nvim_buf_is_valid(bufnr) and state.enabled then
-      M._update_buffer(bufnr)
-    end
-  end))
+  state.debounce_timers[bufnr]:start(
+    M.config.debounce_ms,
+    0,
+    vim.schedule_wrap(function()
+      if vim.api.nvim_buf_is_valid(bufnr) and state.enabled then
+        M._update_buffer(bufnr)
+      end
+    end)
+  )
 end
 
---- Update virtual text for a buffer
----@param bufnr number Buffer number
 function M._update_buffer(bufnr)
-  if not state.enabled then
+  if not state.enabled or not state.backend then
     return
   end
 
   local locale = state.current_locale
   local messages = state.messages[locale] or {}
-  local locales = state.settings and state.settings.locales or {}
+  local locales = state.project and state.project.locales or {}
 
-  -- Parse buffer for message calls
-  local matches = parser.find_message_calls(bufnr)
-
-  -- Render virtual text with all locale info for missing indicator
-  display.render(bufnr, state.namespace, matches, messages, state.messages, locales, M.config.virtual_text)
+  local matches = state.backend.find_message_calls(bufnr)
+  display.render(
+    bufnr,
+    state.namespace,
+    matches,
+    messages,
+    state.messages,
+    locales,
+    M.config.virtual_text
+  )
 end
 
---- Set up file watchers for message files
 function M._setup_file_watchers()
-  -- Clean up existing watchers
   for _, watcher in ipairs(state.file_watchers) do
     watcher:stop()
     watcher:close()
   end
   state.file_watchers = {}
 
-  if not state.project_root or not state.settings then
+  if not state.project or not state.project.watch_paths then
     return
   end
 
-  -- Watch message files for each locale
-  for _, locale in ipairs(state.settings.locales) do
-    local message_path = loader.get_message_path(
-      state.project_root,
-      state.settings.pathPattern,
-      locale
-    )
-
-    if message_path and vim.fn.filereadable(message_path) == 1 then
+  for _, entry in ipairs(state.project.watch_paths) do
+    local locale = entry.locale
+    local path = entry.path
+    if path and vim.fn.filereadable(path) == 1 then
       local watcher = vim.uv.new_fs_event()
       if watcher then
-        watcher:start(message_path, {}, vim.schedule_wrap(function(err, _, _)
-          if not err then
-            -- Reload messages for this locale
-            state.messages[locale] = loader.load_messages(
-              state.project_root,
-              state.settings.pathPattern,
-              locale
-            )
+        watcher:start(
+          path,
+          {},
+          vim.schedule_wrap(function(err, _, _)
+            if err or not state.backend or not state.project then
+              return
+            end
+            state.messages[locale] = state.backend.reload_locale(state.project_root, state.project, locale)
+            state.project.messages[locale] = state.messages[locale]
 
-            -- Refresh all buffers (needed for missing indicator which shows all locales)
             for bufnr, _ in pairs(state.attached_buffers) do
               if vim.api.nvim_buf_is_valid(bufnr) then
                 M._update_buffer(bufnr)
               end
             end
-          end
-        end))
+          end)
+        )
         table.insert(state.file_watchers, watcher)
       end
     end
